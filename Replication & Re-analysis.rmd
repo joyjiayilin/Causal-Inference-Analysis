@@ -1,6 +1,6 @@
 ---
 title: "Relication & Re-analysis"
-author: "Janet Choe & Joy Lin"
+author: "Joy Lin"
 output: pdf_document
 ---
 
