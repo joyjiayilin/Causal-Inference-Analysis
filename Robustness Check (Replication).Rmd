@@ -1,6 +1,6 @@
 ---
 title: "Robustness Check (Replication)"
-author: "Janet Choe & Joy Lin"
+author: "Joy Lin"
 date: "2022-11-29"
 output: html_document
 ---
