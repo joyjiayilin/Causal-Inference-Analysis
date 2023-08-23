@@ -1,0 +1,739 @@
+---
+title: "Robustness Check (Replication)"
+author: "Janet Choe & Joy Lin"
+date: "2022-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+
+# Required libraries
+library("readxl")
+library("foreign")
+library("readstata13")
+library("tidyverse")
+library("lubridate")
+library("miceadds")
+library("robustHD")
+library("igraph")
+library("hdm")
+library('car')
+library("lmtest")
+library("sandwich")
+library("ggplot2")
+library('data.table')
+library("xtable")
+library("quantreg")
+```
+
+# Mobility Data
+```{r}
+# Christmas campaign data
+
+county_data_X = read_excel("../Data/randomized_sample_christmas.xlsx")
+county_data_X= distinct(county_data_X[,c("fips","high_county")])
+colnames(county_data_X)=c("user_loc","high_county_X")
+
+# Thanksgiving campaign data
+
+county_data_T1 = read_excel("../Data/randomized_sample_thanksgiving.xlsx")
+county_data_T1 = county_data_T1 %>% group_by(county) %>% mutate(
+  share_urban = mean(urban)
+)
+county_data_T1= distinct(county_data_T1[,c("county","high_county","share_urban")])
+colnames(county_data_T1)=c("user_loc","high_county_T1","share_urban") 
+
+# Merge both data sets
+
+data=merge(county_data_X,county_data_T1,by="user_loc",all=TRUE)
+
+
+# Add population in each county in 2019
+
+county_pop2019 = read.dta13("../Data/county_pop2019.dta")
+colnames(county_pop2019) = c("popestimate2019", "user_loc")  
+county_pop2019$user_loc=as.numeric(county_pop2019$user_loc)
+
+data = merge(data,county_pop2019,by="user_loc")
+
+
+
+# Import Covid-19 data at county level
+
+covid_counties = read.csv("../Data/us-counties.csv")
+colnames(covid_counties) = c("date",   "county", "state",  "user_loc",   "cases",  "deaths")
+covid_counties$user_loc = as.numeric(covid_counties$user_loc)
+covid_counties$date = as.Date(covid_counties$date, origin = "1960-01-01") 
+covid_counties = covid_counties %>%  filter(date >= "2020-10-01")
+
+covid_counties$state[covid_counties$state=="Rhode Island"]="Rhode_Island"
+covid_counties$state[covid_counties$state=="South Dakota"]="South_Dakota"
+covid_counties$state[covid_counties$state=="North Carolina"]="North_Carolina"
+
+data = merge(data,covid_counties,by = "user_loc",all.x=TRUE)
+ 
+
+# Add a few control variables for the regressions
+
+county_covariates = read.dta13("../Data/county_covariates.dta")
+names(county_covariates)[names(county_covariates) == 'fips'] <- 'user_loc'
+
+# Transformation into proportion variables (e.g number of white people in county -> proportion of white people in county)
+for (var in c("white","asian","islander","raceother","pop18_24","p18_24nohs",
+              "p18_24hs","p18_24somecoll","p18_24bacc","g25","nohsg25","nodegreeg25","hsg25",
+              "somecollg25","assocg25","baccg25","graduatedegreeg25", "g65","hsg65","baccorhigherg65",
+              "povmale","povfemale","povwhite","povindig","povasian", 
+              "povislander","povraceother","povsomecollege","povbaccorhigher","utotal"
+)){
+  county_covariates[[paste0("prop",var)]]=county_covariates[[var]]/county_covariates$population
+}
+
+
+covariates_list_no_FE = colnames(county_covariates)[grepl("prop", colnames(county_covariates), fixed=TRUE)]
+county_covariates = county_covariates[,c("user_loc",covariates_list_no_FE)]
+
+# Build high education variable for heterogeneity analysis
+county_covariates$high_education =as.numeric(county_covariates$prophsg25 > median(county_covariates$prophsg25 ,na.rm=TRUE)) 
+
+data$log_pop = log(data$popestimate2019) #log(county population)
+
+# Addition of log(population) in the control variables
+covariates_list_no_FE = c(covariates_list_no_FE,"log_pop")
+
+# Transform state variable into dummies for DPL controls
+state_values = unique(data$state)
+
+covariates_list =covariates_list_no_FE
+for (s in state_values){
+  data[[paste0("state_",s)]]=as.numeric(data$state==s)
+  covariates_list = c(covariates_list,paste0("state_",s))
+}
+covariates_list=covariates_list[covariates_list!="state_NA"]
+
+# Add regions in the controls
+data = data %>% mutate(
+  
+  region1 = state_Maine+state_Rhode_Island,
+  region2 = state_Illinois+state_Indiana+state_Minnesota,
+  region3 = state_Florida+state_Maryland+state_North_Carolina+state_Virginia+state_Arkansas+state_Oklahoma,
+  region4 = state_Arizona+state_Oregon
+)
+
+covariates_list=c(covariates_list,"region1","region2","region3","region4")
+
+data= merge(data,county_covariates,by="user_loc",all.x=TRUE)
+
+# Add movement variables
+facebook_data = read.dta13("../Data/fb_movement_data.dta")
+colnames(facebook_data)=c("user_loc","county",   "movement_ch",    "stay_home", "date") 
+facebook_data$user_loc=as.numeric(facebook_data$user_loc)
+facebook_data = facebook_data %>% filter(date >= "2020-10-01")
+
+
+data = merge(data,facebook_data,by=c("user_loc","date"),all=TRUE)
+
+## Define "Share Ever Left Home" outcome
+data$leave_home = 1 - data$stay_home
+
+data = data[order(data$date),] # we have to order the data before we define the next variables
+
+## Creation of baseline variables (pre-thanksgiving baseline and pre-christmas baseline)
+
+# Baseline movement
+data = data %>%
+  group_by(user_loc) %>% 
+  mutate(
+    baseline_th_leave_home=ifelse(as.numeric(as.Date("2020/11/13")) %in% as.numeric(date),leave_home[as.numeric(date)==as.numeric(as.Date("2020/11/13"))],NA),
+    baseline_ch_leave_home=ifelse(as.numeric(as.Date("2020/12/13")) %in% as.numeric(date),leave_home[as.numeric(date)==as.numeric(as.Date("2020/12/13"))],NA),
+    baseline_th_movement_ch=ifelse(as.numeric(as.Date("2020/11/13")) %in% as.numeric(date),movement_ch[as.numeric(date)==as.numeric(as.Date("2020/11/13"))],NA),
+    baseline_ch_movement_ch=ifelse(as.numeric(as.Date("2020/12/13")) %in% as.numeric(date),movement_ch[as.numeric(date)==as.numeric(as.Date("2020/12/13"))],NA),
+
+  )
+
+# Baseline cases
+data = data %>%
+  group_by(user_loc) %>% 
+  mutate(
+
+    baseline_th_cumulative_cases=ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+    baseline_ch_cumulative_cases=ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+
+    
+  )
+
+
+# convert outcomes into percentage
+data$leave_home = 100*data$leave_home
+data$movement_ch = 100*data$movement_ch #movement_ch = "Mobility Relative to February 2020" outcome
+
+# Add election data
+
+Election_data = read.dta13("../Data/Election2020.dta")
+Election_data=Election_data[,c("fips2","per_gop","per_dem")]
+colnames(Election_data)=c("user_loc","per_gop","per_dem")
+
+data = merge(data,Election_data,by="user_loc",all.x=TRUE)
+
+
+# Create some covid variables for heterogeneity analysis
+
+data$baseline_th_cumulative_cases_per_capita = data$baseline_th_cumulative_cases - data$log_pop
+data$baseline_ch_cumulative_cases_per_capita = data$baseline_ch_cumulative_cases - data$log_pop
+
+temp =  unique(data[,c("user_loc","baseline_th_cumulative_cases_per_capita","baseline_ch_cumulative_cases_per_capita")])
+
+# Baseline infection rates per capita
+temp$high_infection_rate_th = as.numeric(temp$baseline_th_cumulative_cases_per_capita > median(temp$baseline_th_cumulative_cases_per_capita ,na.rm=TRUE))
+temp$high_infection_rate_ch = as.numeric(temp$baseline_ch_cumulative_cases_per_capita > median(temp$baseline_ch_cumulative_cases_per_capita,na.rm=TRUE))
+
+temp = temp[,c("user_loc","high_infection_rate_th","high_infection_rate_ch")]
+
+data = merge(data,temp,by="user_loc",all.x=TRUE)
+
+
+# Add some mobility variables for heterogeneity analysis (baseline movement)
+temp =  data[,c("user_loc","movement_ch","leave_home","date")]
+temp = temp %>% filter(date >= "2020/10/31") %>% filter(date <= "2020/11/13")
+
+temp = temp %>% group_by(user_loc) %>% mutate(
+  
+  bl_movement = mean(movement_ch),
+  bl_leave_home = mean(leave_home),
+)
+
+# High baseline movement variables
+temp$high_movement = as.numeric(temp$bl_movement> median(temp$bl_movement ,na.rm=TRUE))
+temp$high_leave_home = as.numeric(temp$bl_leave_home > median(temp$bl_leave_home ,na.rm=TRUE))
+
+temp = unique(temp[,c("user_loc","high_movement","high_leave_home")])
+
+
+data = merge(data,temp,by="user_loc",all.x=TRUE)
+```
+
+# Mobility Outcome (Distance)
+```{r}
+data$majority_urban = as.numeric(data$share_urban>0.5)
+heterogeneity_variables = c("majority_urban")
+
+
+for (het_var in heterogeneity_variables){
+
+# distance
+  
+  coefficients = list()
+  standarderrors = list()
+  CI_lower_bound = list()
+  CI_upper_bound = list()
+  pvalues = list()
+  models = list()
+  cmeans = c()
+  nb_obs = list()  
+  
+  control_1_means = list()  
+  control_1_sd = list()  
+  control_2_means = list()  
+  control_2_sd = list()  
+  treatment_1_means = list()  
+  treatment_1_sd = list()  
+  treatment_2_means = list()  
+  treatment_2_sd = list()  
+  i = 1
+  
+  data_X=data %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_T1=data %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_for_regression = bind_rows(data_X,data_T1)
+  indices_X = c(rep(TRUE,nrow(data_X)),rep(FALSE,nrow(data_X)))
+  indices_T1 = c(rep(FALSE,nrow(data_X)),rep(TRUE,nrow(data_X)))
+  
+  var = "movement_ch"
+  data_for_regression$high_infection_rate[indices_T1] = data_T1$high_infection_rate_th
+  data_for_regression$high_infection_rate[indices_X] = data_X$high_infection_rate_ch
+
+    
+    data_for_regression$period_1 = 0
+    data_for_regression$day_1=0
+    data_for_regression$day_2=0
+    data_for_regression$day_3=0
+    data_for_regression$day_4=0
+    data_for_regression$day_5=0
+    data_for_regression$day_6=0
+    data_for_regression$day_7=0
+    data_for_regression$treated = 0
+    
+    
+    data_for_regression$period_1[as.logical(indices_T1*(data_for_regression$date >= "2020-11-23")*(data_for_regression$date <= "2020-11-25"))]=1
+    
+    data_for_regression$day_1[as.logical(indices_T1*(data_for_regression$date == "2020-11-23"))]=1
+    
+    data_for_regression$day_2[as.logical(indices_T1*(data_for_regression$date == "2020-11-24"))]=1
+    
+    data_for_regression$day_3[as.logical(indices_T1*(data_for_regression$date == "2020-11-25"))]=1
+
+    
+    data_for_regression$treated[indices_T1] =  data_T1$high_county_T1
+  
+      data_for_regression$treated_het_var = data_for_regression$treated * data_for_regression[[het_var]]
+      data_for_regression$het_var=data_for_regression[[het_var]]
+ 
+
+    
+    
+    data_for_regression$period_1[as.logical(indices_X*(data_for_regression$date >= "2020-12-21")*(data_for_regression$date <= "2020-12-23"))]=1
+    
+    
+    data_for_regression$day_1[as.logical(indices_X*(data_for_regression$date == "2020-12-21"))]=1
+    
+    
+    data_for_regression$day_2[as.logical(indices_X*(data_for_regression$date == "2020-12-22"))]=1
+    
+    
+    data_for_regression$day_3[as.logical(indices_X*(data_for_regression$date == "2020-12-23"))]=1
+    
+    
+    
+    
+    data_for_regression$treated[indices_X] =  data_X$high_county_X
+
+      data_for_regression$treated_het_var = data_for_regression$treated * data_for_regression[[het_var]]
+      data_for_regression$het_var=data_for_regression[[het_var]]
+      
+
+    
+    
+    formula_str = paste0(var," ~ day_1 + day_2 + day_3 + treated_het_var + treated + het_var+  (day_1 + day_2 + day_3):baseline_th_",var)
+    treatments_for_reg = c("treated","treated_het_var","het_var")
+    
+    
+    data_reg =  data_for_regression %>% filter(period_1==1) %>% filter(!is.na(treated))
+    
+
+    baseline_var=paste0("baseline_th_",var)
+
+    reg = lm.cluster(formula = as.formula(formula_str), data = data_reg, cluster = "user_loc")
+      
+ 
+    reg_summary <- summary(reg)
+    
+    # Distance Results:
+    print(reg_summary[4, ])
+    print(paste0("Confidence Intervals w/ interaction: (", 
+                 reg_summary[4,][1] - 1.96*reg_summary[4,][2], ",", 
+                 reg_summary[4,][1] + 1.96*reg_summary[4,][2], ")"))
+}
+```
+
+# Mobility Outcome (Leaving Home)
+```{r}
+data$majority_urban = as.numeric(data$share_urban>0.5)
+heterogeneity_variables = c("majority_urban")
+
+for (het_var in heterogeneity_variables){
+
+  #for leave home
+  
+  coefficients = list()
+  standarderrors = list()
+  CI_lower_bound = list()
+  CI_upper_bound = list()
+  pvalues = list()
+  models <- list()
+  cmeans <- c()
+  nb_obs = list()  
+  
+  control_1_means = list()  
+  control_1_sd = list()  
+  control_2_means = list()  
+  control_2_sd = list()  
+  treatment_1_means = list()  
+  treatment_1_sd = list()  
+  treatment_2_means = list()  
+  treatment_2_sd = list()  
+  i = 1
+  
+  data_X=data %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_T1=data %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_for_regression = bind_rows(data_X,data_T1)
+  indices_X = c(rep(TRUE,nrow(data_X)),rep(FALSE,nrow(data_X)))
+  indices_T1 = c(rep(FALSE,nrow(data_X)),rep(TRUE,nrow(data_X)))
+  data_for_regression$high_infection_rate[indices_T1] = data_T1$high_infection_rate_th
+  data_for_regression$high_infection_rate[indices_X] = data_X$high_infection_rate_ch
+  var = "leave_home"
+    
+    
+    data_for_regression$period_1 = 0
+    data_for_regression$day_1=0
+    data_for_regression$day_2=0
+    data_for_regression$day_3=0
+    data_for_regression$day_4=0
+    data_for_regression$day_5=0
+    data_for_regression$day_6=0
+    data_for_regression$day_7=0
+    data_for_regression$treated =  0
+    
+    
+    data_for_regression$period_1[as.logical(indices_T1*(data_for_regression$date == "2020-11-26"))]=1
+    
+    data_for_regression$day_1[as.logical(indices_T1*(data_for_regression$date == "2020-11-26"))]=1
+
+    
+    data_for_regression$treated[indices_T1] =  data_T1$high_county_T1
+
+      data_for_regression$treated_het_var = data_for_regression$treated * data_for_regression[[het_var]]
+      data_for_regression$het_var=data_for_regression[[het_var]]
+      
+    
+    
+    
+    data_for_regression$period_1[as.logical(indices_X*(data_for_regression$date >= "2020-12-24")*(data_for_regression$date <= "2020-12-25"))]=1
+    
+    
+    data_for_regression$day_1[as.logical(indices_X*(data_for_regression$date == "2020-12-24"))]=1
+    
+    
+    data_for_regression$day_2[as.logical(indices_X*(data_for_regression$date == "2020-12-25"))]=1
+
+    
+    data_for_regression$treated[indices_X] =  data_X$high_county_X
+
+      data_for_regression$treated_het_var = data_for_regression$treated * data_for_regression[[het_var]]
+      data_for_regression$het_var=data_for_regression[[het_var]]
+      
+    
+    
+    
+    formula_str = paste0(var," ~ day_1 + day_2  + treated_het_var + treated + het_var +  (day_1 + day_2):baseline_th_",var)
+    treatments_for_reg = c("treated","treated_het_var","het_var")
+    
+    
+    data_reg =  data_for_regression %>% filter(period_1==1) %>% filter(!is.na(treated))
+    
+
+    baseline_var=paste0("baseline_th_",var)
+
+    reg = lm.cluster(formula = as.formula(formula_str), data = data_reg, cluster = "user_loc")
+    
+
+    reg_summary = summary(reg)
+    
+    # Leaving Home Results:
+    print(reg_summary[3, ])
+    print(paste0("Confidence Intervals w/ interaction: (", 
+                 reg_summary[3,][1] - 1.96*reg_summary[3,][2], ",", 
+                 reg_summary[3,][1] + 1.96*reg_summary[3,][2], ")"))
+}
+```
+
+# COVID-19 Data
+```{r}
+rm(list = ls())
+
+set.seed(789917873)
+
+## Import Covid data (zip level)
+covid_zip = read.csv("../Data/clean_cases.csv") # colnames = "state"  "zip"    "date"   "t"      "cases"  "change"
+dates = c(20201112,20201116,20201119,20201123,20201126,20201130,20201203,20201207,20201210,20201214,20201217,20201221,20201224,20201228,20201231,20210104,20210107,20210111,20210114,
+          20210118,20210121,20210125,20210128,20210201,20210204,20210208,20210211,20210215,20210218,20210222)
+
+for (i in 1:30){
+  covid_zip$date[covid_zip$t==i]=dates[i]
+}
+
+covid_zip$date =  as.character(covid_zip$date)
+covid_zip$date =as.Date(covid_zip$date,  format = "%Y%m%d") 
+
+covid_zip$cases=as.numeric(covid_zip$cases)
+## Virginia has no data on "2021-01-04" so we fill it with 0 to avoid any problem
+Virginia_zips = unique(covid_zip$zip[covid_zip$state=="VA"])
+Virginia_zips = Virginia_zips[!is.na(Virginia_zips )]
+
+for (z in Virginia_zips){
+  temp = covid_zip %>% filter(date =="2020-12-31") %>% filter(zip==z)
+  c = temp$cases
+  covid_zip[nrow(covid_zip) + 1,] = c("VA",z,"2021-01-04",16,c,0)
+}
+
+##
+
+# Import treatment data for both campaigns 
+
+thanksgiving_data = read_excel("../Data/randomized_sample_thanksgiving.xlsx")
+
+thanksgiving_data = thanksgiving_data %>% group_by(county) %>% mutate(
+  
+  share_urban = mean(urban)
+  
+)
+
+thanksgiving_data = thanksgiving_data[,c("county","high_county","zip","treat","share_urban","urban")]
+colnames(thanksgiving_data)=c("user_loc","high_county_T1","zip","treated_T1","share_urban","urban")
+
+christmas_data = read_excel("../Data/randomized_sample_christmas.xlsx")
+christmas_data = christmas_data[,c("fips","high_county","zip","treat")]
+colnames(christmas_data)=c("user_loc","high_county_X","zip","treated_X")
+
+
+# Thanksgiving zips 
+data = merge(covid_zip,thanksgiving_data ,by=c("zip"))
+data = merge(data,christmas_data ,by=c("zip","user_loc"),all.x=TRUE)
+
+
+
+
+# Population data
+county_pop2019 = read.dta13("../Data/county_pop2019.dta")
+colnames(county_pop2019) = c("popestimate2019", "user_loc")  
+county_pop2019$user_loc=as.numeric(county_pop2019$user_loc)
+
+data = merge(data,county_pop2019,by="user_loc")
+
+data$log_pop = log(data$popestimate2019)
+
+
+# A few county covariates
+county_covariates = read.dta13("../Data/county_covariates.dta")
+names(county_covariates)[names(county_covariates) == 'fips'] <- 'user_loc'
+
+# Transformation into proportion variables (e.g number of white people in county -> proportion of white people in county)
+for (var in c("white","asian","islander","raceother","pop18_24","p18_24nohs",
+              "p18_24hs","p18_24somecoll","p18_24bacc","g25","nohsg25","nodegreeg25","hsg25",
+              "somecollg25","assocg25","baccg25","graduatedegreeg25", "g65","hsg65","baccorhigherg65",
+              "povmale","povfemale","povwhite","povindig","povasian", 
+              "povislander","povraceother","povsomecollege","povbaccorhigher","utotal"
+)){
+  county_covariates[[paste0("prop",var)]]=county_covariates[[var]]/county_covariates$population
+}
+
+
+covariates_list = colnames(county_covariates)[grepl("prop", colnames(county_covariates), fixed=TRUE)]
+county_covariates = county_covariates[,c("user_loc",covariates_list)]
+
+covariates_list = c(covariates_list,"log_pop")
+
+county_covariates$high_education =as.numeric(county_covariates$prophsg25 > median(county_covariates$prophsg25 ,na.rm=TRUE))
+
+data= merge(data,county_covariates,by="user_loc",all.x=TRUE)
+
+data = data[order(data$date),] # we have to order the data before we define the next variables
+
+# Data includes some rare negative cases (i.e cumulative cases are locally decreasing)
+# We correct them with a linear smoothing between dates t-2 and t+2 (if t is the negative jump date)
+
+# Detail of the correction method: let (c(i))_i be the time series of cumulative cases in a given zip
+# For each date t, if t is such that "c(t) < c(t-1)":
+# - Replace c(i) (i between t-2 and t+2) with: c(t-2) + (c(t+2)-c(t-2))*(i-t+2)/4 
+
+
+correct_errors <- function(time_series,k){
+  n = length(time_series)
+  if (n-2*k-1>0){
+    for (i in ((k+1):(n-k))){
+      current_value = time_series[i]
+      previous_value = time_series[i-1]
+      if ((!is.na(current_value))*!(is.na(previous_value))){
+        if (current_value< previous_value){
+          
+          
+          time_series[(i-k):(i+k)]=linear_replacement(time_series[(i-k):(i+k)],k)
+        }
+      }
+    }
+    return(time_series)
+  }else{return(time_series)}
+}
+
+linear_replacement <- function(time_series,k){
+  
+  start = time_series[1]
+  end = time_series[1+2*k]
+  result = c()
+  for (i in 1:(1+2*k)){
+    result = c(result,start + (end-start)*(i-1)/(2*k))
+  }
+  return(result)
+}
+
+data$cases=as.numeric(data$cases)
+
+# Zip cases
+data <- data %>%
+  group_by(zip) %>%
+  mutate(
+
+    corrected_cases_2 = round(correct_errors(cases,2)), 
+    corrected_change_2 = diff(c(NA,corrected_cases_2), lag = 1, differences = 1,na.rm=T),
+  ) 
+
+data$corrected_change_2[data$corrected_change_2<0]=0
+
+data <- data %>%
+  group_by(zip) %>%
+  mutate(
+    two_weeks_cases = apply(embed(c(rep(NA,3),corrected_change_2),4),1,sum),
+  ) 
+
+
+data$two_weeks_cases_half_min = data$two_weeks_cases
+data$two_weeks_cases_half_min[data$two_weeks_cases_half_min ==0]=0.5
+
+data$two_weeks_cases_zeros_omitted= data$two_weeks_cases
+data$two_weeks_cases_zeros_omitted[data$two_weeks_cases_zeros_omitted ==0]=NA
+
+# Definition of the outcomes
+data$asinh_two_weeks_cases = asinh(data$two_weeks_cases)
+data$log_two_weeks_cases_plus_1 = log(data$two_weeks_cases+1) 
+data$log_two_weeks_cases_half_min = log(data$two_weeks_cases_half_min) 
+data$log_two_weeks_cases_zeros_omitted = log(data$two_weeks_cases_zeros_omitted)
+
+data$cases[data$cases==0]=0.5
+data$log_cases = log(data$cases)
+
+data = data %>%
+  group_by(zip) %>% 
+  mutate(
+  baseline_th_log_cases = ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),log_cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+    baseline_ch_log_cases = ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),log_cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+  baseline_th_cases = ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+  baseline_ch_cases = ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+)
+
+
+
+Election_data = read.dta13("../Data/Election2020.dta")
+
+Election_data=Election_data[,c("fips2","per_gop","per_dem")]
+colnames(Election_data)=c("user_loc","per_gop","per_dem")
+
+
+data = merge(data,Election_data,by="user_loc",all.x=TRUE)
+
+# Data containing the movement variables
+facebook_data = read.dta13("../Data/fb_movement_data.dta")
+colnames(facebook_data)=c("user_loc","county",   "movement_ch",    "stay_home", "date")
+facebook_data$user_loc=as.numeric(facebook_data$user_loc)
+facebook_data = facebook_data %>% filter(date >= "2020-10-01")
+
+
+data = merge(data,facebook_data,by=c("user_loc","date"),all=TRUE)
+
+
+data$leave_home = 1 - data$stay_home
+
+
+# Add some mobility variables for heterogeneity analysis
+temp =  distinct(data[,c("user_loc","movement_ch","leave_home","date","propurban")])
+temp = temp %>% filter(date >= "2020/10/31") %>% filter(date <= "2020/11/13")
+
+temp = temp %>% group_by(user_loc) %>% mutate(
+
+  bl_movement = mean(movement_ch),
+  bl_leave_home = mean(leave_home),
+)
+
+temp$high_movement = as.numeric(temp$bl_movement> median(temp$bl_movement ,na.rm=TRUE))
+temp$high_leave_home = as.numeric(temp$bl_leave_home > median(temp$bl_leave_home ,na.rm=TRUE))
+
+
+temp = unique(temp[,c("user_loc","high_movement","high_leave_home")])
+
+data = merge(data,temp,by="user_loc",all.x=TRUE)
+
+data$majority_gop = as.numeric(data$per_gop>data$per_dem)
+```
+
+# COVID-19 Outcome
+```{r}
+temp = distinct(data[,c("zip","user_loc",
+                        "baseline_ch_log_cases",
+                        "baseline_th_log_cases")])
+
+temp$high_log_cumulative_cases_th = as.numeric(temp$baseline_th_log_cases >median(temp$baseline_th_log_cases,na.rm=TRUE))
+temp$high_log_cumulative_cases_ch = as.numeric(temp$baseline_ch_log_cases >median(temp$baseline_ch_log_cases,na.rm=TRUE))
+
+data_het= merge(data,temp[,c("user_loc","zip","high_log_cumulative_cases_th","high_log_cumulative_cases_ch")],by=c("user_loc","zip"),all.x=TRUE)
+
+temp = distinct(data_het[,c("user_loc","propurban")])
+temp$high_urban = as.numeric(temp$propurban > median(temp$propurban,na.rm=TRUE))
+temp=na.omit(temp)
+data_het = merge(data_het,temp[,c("user_loc","high_urban")],by=c("user_loc"),all.x=TRUE)
+
+data_het$majority_urban = as.numeric(data_het$share_urban>0.5)
+
+data_het$urban_rep = data_het$majority_gop * data_het$majority_urban
+data_het$not_in_X_sample=as.numeric(!(data_het$user_loc %in% christmas_data$user_loc))
+
+heterogeneity_variables = c("majority_urban")
+
+for (het_var in heterogeneity_variables){
+  var="asinh_two_weeks_cases"
+  coefficients = list()
+  standarderrors = list()
+  CI_lower_bound = list()
+  CI_upper_bound = list()
+  pvalues = list()
+  models <- list()
+  cmeans <- c()
+  nb_obs = list()  
+
+  i = 1
+  
+  data_X=data_het %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_T1=data_het %>% filter(!(is.na(high_county_X)*is.na(high_county_T1)))
+  data_for_regression = bind_rows(data_X,data_T1)
+  indices_X = c(rep(TRUE,nrow(data_X)),rep(FALSE,nrow(data_X)))
+  indices_T1 = c(rep(FALSE,nrow(data_X)),rep(TRUE,nrow(data_X)))
+  
+  
+  dates_T1 = c("2020-12-14","2020-12-28","2021-01-11")
+  dates_X = c("2021-01-14","2021-01-28","2021-02-11")
+  
+  
+  for (d in c(1:1)){
+    
+    formula_str = paste0(var," ~ treated_het_var + treated + het_var+ baseline_log_cases + high_county + factor(user_loc)")
+    data_for_regression$period_1 = 0
+    data_for_regression$treated =  0
+    data_for_regression$high_county =  0
+    data_for_regression$baseline_log_cases=0
+    
+    data_for_regression$period_1[as.logical(indices_T1*(data_for_regression$date == dates_T1[d]))]=1
+    
+    
+    data_for_regression$treated[indices_T1] =  data_T1$treated_T1
+    data_for_regression$high_county[indices_T1] =  data_T1$high_county_T1
+    data_for_regression$baseline_log_cases[indices_T1] =data_T1$baseline_th_log_cases
+    data_for_regression$high_log_cumulative_cases[indices_T1]=data_T1$high_log_cumulative_cases_th
+    
+    data_for_regression$period_1[as.logical(indices_X*(data_for_regression$date == dates_X[d]))]=1
+    
+    data_for_regression$treated[indices_X] =  data_X$treated_X
+    data_for_regression$high_county[indices_X] =  data_X$high_county_X
+    data_for_regression$baseline_log_cases[indices_X] =data_X$baseline_ch_log_cases
+    data_for_regression$high_log_cumulative_cases[indices_X]=data_T1$high_log_cumulative_cases_ch
+    
+    data_reg = data_for_regression %>% filter(period_1==1) %>% filter(!is.na(high_county))
+    
+    data_reg$het_var = data_reg[[het_var]]
+    
+    data_reg$treated_het_var = data_reg$het_var * data_reg$treated 
+    
+    reg = lm.cluster(formula = as.formula(formula_str), data = data_reg,cluster="zip")
+    
+    reg_summary <- summary(reg)
+    
+    # COVID Results:
+    print(reg_summary[2, ])
+    print(paste0("Confidence Intervals w/ interaction: (", 
+                 reg_summary[2,][1] - 1.96*reg_summary[2,][2], ",", 
+                 reg_summary[2,][1] + 1.96*reg_summary[2,][2], ")"))
+      i=i+1
+}}
+```
+
+```{r}
+reg_summary
+reg_summary[4,][1]
+```
+

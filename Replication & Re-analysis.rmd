@@ -1,0 +1,1112 @@
+---
+title: "Relication & Re-analysis"
+author: "Janet Choe & Joy Lin"
+output: pdf_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+library(tidyverse)
+library(rdrobust)
+library(rddtools)
+library(stats)
+library(gnm)
+library(dplyr)
+library(readxl)
+library(readstata13)
+library(miceadds)
+library(hdm)
+rm(list=ls())
+```
+
+
+
+# Cleaning Mobility Data
+
+```{r}
+
+# Christmas campaign data
+
+county_data_X = read_excel("randomized_sample_christmas.xlsx")
+county_data_X= distinct(county_data_X[,c("fips","high_county")])
+colnames(county_data_X)=c("user_loc","high_county_X")
+
+# Thanksgiving campaign data
+
+county_data_T1 = read_excel("randomized_sample_thanksgiving.xlsx")
+county_data_T1 = county_data_T1 %>% group_by(county) %>% mutate(
+  share_urban = mean(urban)
+)
+county_data_T1= distinct(county_data_T1[,c("county","high_county","share_urban")])
+colnames(county_data_T1)=c("user_loc","high_county_T1","share_urban") 
+
+# Merge both data sets
+
+data=merge(county_data_X,county_data_T1,by="user_loc",all=TRUE)
+
+
+# Add population in each county in 2019
+
+county_pop2019 = read.dta13("county_pop2019.dta")
+colnames(county_pop2019) = c("popestimate2019", "user_loc")  
+county_pop2019$user_loc=as.numeric(county_pop2019$user_loc)
+
+data = merge(data,county_pop2019,by="user_loc")
+
+
+
+# Import Covid-19 data at county level
+
+covid_counties = read.csv("us-counties.csv")
+colnames(covid_counties) = c("date",   "county", "state",  "user_loc",   "cases",  "deaths")
+covid_counties$user_loc = as.numeric(covid_counties$user_loc)
+covid_counties$date = as.Date(covid_counties$date, origin = "1960-01-01") 
+covid_counties = covid_counties %>%  filter(date >= "2020-10-01")
+
+covid_counties$state[covid_counties$state=="Rhode Island"]="Rhode_Island"
+covid_counties$state[covid_counties$state=="South Dakota"]="South_Dakota"
+covid_counties$state[covid_counties$state=="North Carolina"]="North_Carolina"
+
+data = merge(data,covid_counties,by = "user_loc",all.x=TRUE)
+ 
+
+# Add a few control variables for the regressions
+
+county_covariates = read.dta13("county_covariates.dta")
+names(county_covariates)[names(county_covariates) == 'fips'] <- 'user_loc'
+
+# Transformation into proportion variables (e.g number of white people in county -> proportion of white people in county)
+for (var in c("white","asian","islander","raceother","pop18_24","p18_24nohs",
+              "p18_24hs","p18_24somecoll","p18_24bacc","g25","nohsg25","nodegreeg25","hsg25",
+              "somecollg25","assocg25","baccg25","graduatedegreeg25", "g65","hsg65","baccorhigherg65",
+              "povmale","povfemale","povwhite","povindig","povasian", 
+              "povislander","povraceother","povsomecollege","povbaccorhigher","utotal"
+)){
+  county_covariates[[paste0("prop",var)]]=county_covariates[[var]]/county_covariates$population
+}
+
+
+covariates_list_no_FE = colnames(county_covariates)[grepl("prop", colnames(county_covariates), fixed=TRUE)]
+county_covariates = county_covariates[,c("user_loc",covariates_list_no_FE)]
+
+# Build high education variable for heterogeneity analysis
+county_covariates$high_education =as.numeric(county_covariates$prophsg25 > median(county_covariates$prophsg25 ,na.rm=TRUE)) 
+
+data$log_pop = log(data$popestimate2019) #log(county population)
+
+# Addition of log(population) in the control variables
+covariates_list_no_FE = c(covariates_list_no_FE,"log_pop")
+
+# Transform state variable into dummies for DPL controls
+state_values = unique(data$state)
+
+covariates_list =covariates_list_no_FE
+for (s in state_values){
+  data[[paste0("state_",s)]]=as.numeric(data$state==s)
+  covariates_list = c(covariates_list,paste0("state_",s))
+}
+covariates_list=covariates_list[covariates_list!="state_NA"]
+
+# Add regions in the controls
+data = data %>% mutate(
+  
+  region1 = state_Maine+state_Rhode_Island,
+  region2 = state_Illinois+state_Indiana+state_Minnesota,
+  region3 = state_Florida+state_Maryland+state_North_Carolina+state_Virginia+state_Arkansas+state_Oklahoma,
+  region4 = state_Arizona+state_Oregon
+)
+
+covariates_list=c(covariates_list,"region1","region2","region3","region4")
+
+data= merge(data,county_covariates,by="user_loc",all.x=TRUE)
+
+# Add movement variables
+facebook_data = read.dta13("fb_movement_data.dta")
+colnames(facebook_data)=c("user_loc","county",   "movement_ch",    "stay_home", "date") 
+facebook_data$user_loc=as.numeric(facebook_data$user_loc)
+facebook_data = facebook_data %>% filter(date >= "2020-10-01")
+
+
+data = merge(data,facebook_data,by=c("user_loc","date"),all=TRUE)
+
+## Define "Share Ever Left Home" outcome
+data$leave_home = 1 - data$stay_home
+
+data = data[order(data$date),] # we have to order the data before we define the next variables
+
+## Creation of baseline variables (pre-thanksgiving baseline and pre-christmas baseline)
+
+# Baseline movement
+data = data %>%
+  group_by(user_loc) %>% 
+  mutate(
+    baseline_th_leave_home=ifelse(as.numeric(as.Date("2020/11/13")) %in% as.numeric(date),leave_home[as.numeric(date)==as.numeric(as.Date("2020/11/13"))],NA),
+    baseline_ch_leave_home=ifelse(as.numeric(as.Date("2020/12/13")) %in% as.numeric(date),leave_home[as.numeric(date)==as.numeric(as.Date("2020/12/13"))],NA),
+    baseline_th_movement_ch=ifelse(as.numeric(as.Date("2020/11/13")) %in% as.numeric(date),movement_ch[as.numeric(date)==as.numeric(as.Date("2020/11/13"))],NA),
+    baseline_ch_movement_ch=ifelse(as.numeric(as.Date("2020/12/13")) %in% as.numeric(date),movement_ch[as.numeric(date)==as.numeric(as.Date("2020/12/13"))],NA),
+
+  )
+
+# Baseline cases
+data = data %>%
+  group_by(user_loc) %>% 
+  mutate(
+
+    baseline_th_cumulative_cases=ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+    baseline_ch_cumulative_cases=ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+
+    
+  )
+
+
+# convert outcomes into percentage
+data$leave_home = 100*data$leave_home
+data$movement_ch = 100*data$movement_ch #movement_ch = "Mobility Relative to February 2020" outcome
+
+# Add election data
+
+Election_data = read.dta13("Election2020.dta")
+Election_data=Election_data[,c("fips2","per_gop","per_dem")]
+colnames(Election_data)=c("user_loc","per_gop","per_dem")
+
+data = merge(data,Election_data,by="user_loc",all.x=TRUE)
+
+
+# Create some covid variables for heterogeneity analysis
+
+data$baseline_th_cumulative_cases_per_capita = data$baseline_th_cumulative_cases - data$log_pop
+data$baseline_ch_cumulative_cases_per_capita = data$baseline_ch_cumulative_cases - data$log_pop
+
+temp =  unique(data[,c("user_loc","baseline_th_cumulative_cases_per_capita","baseline_ch_cumulative_cases_per_capita")])
+
+# Baseline infection rates per capita
+temp$high_infection_rate_th = as.numeric(temp$baseline_th_cumulative_cases_per_capita > median(temp$baseline_th_cumulative_cases_per_capita ,na.rm=TRUE))
+temp$high_infection_rate_ch = as.numeric(temp$baseline_ch_cumulative_cases_per_capita > median(temp$baseline_ch_cumulative_cases_per_capita,na.rm=TRUE))
+
+temp = temp[,c("user_loc","high_infection_rate_th","high_infection_rate_ch")]
+
+data = merge(data,temp,by="user_loc",all.x=TRUE)
+
+
+# Add some mobility variables for heterogeneity analysis (baseline movement)
+temp =  data[,c("user_loc","movement_ch","leave_home","date")]
+temp = temp %>% filter(date >= "2020/10/31") %>% filter(date <= "2020/11/13")
+
+temp = temp %>% group_by(user_loc) %>% mutate(
+  
+  bl_movement = mean(movement_ch),
+  bl_leave_home = mean(leave_home),
+)
+
+# High baseline movement variables
+temp$high_movement = as.numeric(temp$bl_movement> median(temp$bl_movement ,na.rm=TRUE))
+temp$high_leave_home = as.numeric(temp$bl_leave_home > median(temp$bl_leave_home ,na.rm=TRUE))
+
+temp = unique(temp[,c("user_loc","high_movement","high_leave_home")])
+
+
+data2 = merge(data,temp,by="user_loc",all.x=TRUE)
+
+```
+
+
+
+# Cleaning COVID Data
+
+```{r}
+set.seed(789917873)
+
+## Import Covid data (zip level)
+covid_zip = read.csv("clean_cases.csv") # colnames = "state"  "zip"    "date"   "t"      "cases"  "change"
+dates = c(20201112,20201116,20201119,20201123,20201126,20201130,20201203,20201207,20201210,20201214,20201217,20201221,20201224,20201228,20201231,20210104,20210107,20210111,20210114,
+          20210118,20210121,20210125,20210128,20210201,20210204,20210208,20210211,20210215,20210218,20210222)
+
+for (i in 1:30){
+  covid_zip$date[covid_zip$t==i]=dates[i]
+}
+
+covid_zip$date =  as.character(covid_zip$date)
+covid_zip$date =as.Date(covid_zip$date,  format = "%Y%m%d") 
+
+covid_zip$cases=as.numeric(covid_zip$cases)
+## Virginia has no data on "2021-01-04" so we fill it with 0 to avoid any problem
+Virginia_zips = unique(covid_zip$zip[covid_zip$state=="VA"])
+Virginia_zips = Virginia_zips[!is.na(Virginia_zips )]
+
+for (z in Virginia_zips){
+  temp = covid_zip %>% filter(date =="2020-12-31") %>% filter(zip==z)
+  c = temp$cases
+  covid_zip[nrow(covid_zip) + 1,] = c("VA",z,"2021-01-04",16,c,0)
+}
+
+##
+
+# Import treatment data for both campaigns 
+
+thanksgiving_data = read_excel("randomized_sample_thanksgiving.xlsx")
+
+thanksgiving_data = thanksgiving_data %>% group_by(county) %>% mutate(
+  
+  share_urban = mean(urban)
+  
+)
+
+thanksgiving_data = thanksgiving_data[,c("county","high_county","zip","treat","share_urban","urban")]
+colnames(thanksgiving_data)=c("user_loc","high_county_T1","zip","treated_T1","share_urban","urban")
+
+christmas_data = read_excel("randomized_sample_christmas.xlsx")
+christmas_data = christmas_data[,c("fips","high_county","zip","treat")]
+colnames(christmas_data)=c("user_loc","high_county_X","zip","treated_X")
+
+
+# Thanksgiving zips 
+data = merge(covid_zip,thanksgiving_data ,by=c("zip"))
+data = merge(data,christmas_data ,by=c("zip","user_loc"),all.x=TRUE)
+
+
+
+
+# Population data
+county_pop2019 = read.dta13("county_pop2019.dta")
+colnames(county_pop2019) = c("popestimate2019", "user_loc")  
+county_pop2019$user_loc=as.numeric(county_pop2019$user_loc)
+
+data = merge(data,county_pop2019,by="user_loc")
+
+data$log_pop = log(data$popestimate2019)
+
+
+# A few county covariates
+county_covariates = read.dta13("county_covariates.dta")
+names(county_covariates)[names(county_covariates) == 'fips'] <- 'user_loc'
+
+# Transformation into proportion variables (e.g number of white people in county -> proportion of white people in county)
+for (var in c("white","asian","islander","raceother","pop18_24","p18_24nohs",
+              "p18_24hs","p18_24somecoll","p18_24bacc","g25","nohsg25","nodegreeg25","hsg25",
+              "somecollg25","assocg25","baccg25","graduatedegreeg25", "g65","hsg65","baccorhigherg65",
+              "povmale","povfemale","povwhite","povindig","povasian", 
+              "povislander","povraceother","povsomecollege","povbaccorhigher","utotal"
+)){
+  county_covariates[[paste0("prop",var)]]=county_covariates[[var]]/county_covariates$population
+}
+
+
+covariates_list = colnames(county_covariates)[grepl("prop", colnames(county_covariates), fixed=TRUE)]
+county_covariates = county_covariates[,c("user_loc",covariates_list)]
+
+covariates_list = c(covariates_list,"log_pop")
+
+county_covariates$high_education =as.numeric(county_covariates$prophsg25 > median(county_covariates$prophsg25 ,na.rm=TRUE))
+
+data= merge(data,county_covariates,by="user_loc",all.x=TRUE)
+
+data = data[order(data$date),] # we have to order the data before we define the next variables
+
+# Data includes some rare negative cases (i.e cumulative cases are locally decreasing)
+# We correct them with a linear smoothing between dates t-2 and t+2 (if t is the negative jump date)
+
+# Detail of the correction method: let (c(i))_i be the time series of cumulative cases in a given zip
+# For each date t, if t is such that "c(t) < c(t-1)":
+# - Replace c(i) (i between t-2 and t+2) with: c(t-2) + (c(t+2)-c(t-2))*(i-t+2)/4 
+
+
+correct_errors <- function(time_series,k){
+  n = length(time_series)
+  if (n-2*k-1>0){
+    for (i in ((k+1):(n-k))){
+      current_value = time_series[i]
+      previous_value = time_series[i-1]
+      if ((!is.na(current_value))*!(is.na(previous_value))){
+        if (current_value< previous_value){
+          
+          
+          time_series[(i-k):(i+k)]=linear_replacement(time_series[(i-k):(i+k)],k)
+        }
+      }
+    }
+    return(time_series)
+  }else{return(time_series)}
+}
+
+linear_replacement <- function(time_series,k){
+  
+  start = time_series[1]
+  end = time_series[1+2*k]
+  result = c()
+  for (i in 1:(1+2*k)){
+    result = c(result,start + (end-start)*(i-1)/(2*k))
+  }
+  return(result)
+}
+
+data$cases=as.numeric(data$cases)
+
+# Zip cases
+data <- data %>%
+  group_by(zip) %>%
+  mutate(
+
+    corrected_cases_2 = round(correct_errors(cases,2)), 
+    corrected_change_2 = diff(c(NA,corrected_cases_2), lag = 1, differences = 1,na.rm=T),
+  ) 
+
+data$corrected_change_2[data$corrected_change_2<0]=0
+
+data <- data %>%
+  group_by(zip) %>%
+  mutate(
+    two_weeks_cases = apply(embed(c(rep(NA,3),corrected_change_2),4),1,sum),
+  ) 
+
+
+data$two_weeks_cases_half_min = data$two_weeks_cases
+data$two_weeks_cases_half_min[data$two_weeks_cases_half_min ==0]=0.5
+
+data$two_weeks_cases_zeros_omitted= data$two_weeks_cases
+data$two_weeks_cases_zeros_omitted[data$two_weeks_cases_zeros_omitted ==0]=NA
+
+# Definition of the outcomes
+data$asinh_two_weeks_cases = asinh(data$two_weeks_cases)
+data$log_two_weeks_cases_plus_1 = log(data$two_weeks_cases+1) 
+data$log_two_weeks_cases_half_min = log(data$two_weeks_cases_half_min) 
+data$log_two_weeks_cases_zeros_omitted = log(data$two_weeks_cases_zeros_omitted)
+
+data$cases[data$cases==0]=0.5
+data$log_cases = log(data$cases)
+
+data = data %>%
+  group_by(zip) %>% 
+  mutate(
+  baseline_th_log_cases = ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),log_cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+    baseline_ch_log_cases = ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),log_cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+  baseline_th_cases = ifelse(as.numeric(as.Date("2020/11/12")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/11/12"))],NA),
+  baseline_ch_cases = ifelse(as.numeric(as.Date("2020/12/14")) %in% as.numeric(date),cases[as.numeric(date)==as.numeric(as.Date("2020/12/14"))],NA),
+)
+
+# Election data
+
+Election_data = read.dta13("Election2020.dta")
+
+Election_data=Election_data[,c("fips2","per_gop","per_dem")]
+colnames(Election_data)=c("user_loc","per_gop","per_dem")
+
+
+data = merge(data,Election_data,by="user_loc",all.x=TRUE)
+
+# Data containing the movement variables
+facebook_data = read.dta13("fb_movement_data.dta")
+colnames(facebook_data)=c("user_loc","county",   "movement_ch",    "stay_home", "date")
+facebook_data$user_loc=as.numeric(facebook_data$user_loc)
+facebook_data = facebook_data %>% filter(date >= "2020-10-01")
+
+
+data = merge(data,facebook_data,by=c("user_loc","date"),all=TRUE)
+
+
+data$leave_home = 1 - data$stay_home
+
+
+# Add some mobility variables for heterogeneity analysis
+temp =  distinct(data[,c("user_loc","movement_ch","leave_home","date","propurban")])
+temp = temp %>% filter(date >= "2020/10/31") %>% filter(date <= "2020/11/13")
+
+temp = temp %>% group_by(user_loc) %>% mutate(
+
+  bl_movement = mean(movement_ch),
+  bl_leave_home = mean(leave_home),
+)
+
+temp$high_movement = as.numeric(temp$bl_movement> median(temp$bl_movement ,na.rm=TRUE))
+temp$high_leave_home = as.numeric(temp$bl_leave_home > median(temp$bl_leave_home ,na.rm=TRUE))
+
+
+temp = unique(temp[,c("user_loc","high_movement","high_leave_home")])
+
+data = merge(data,temp,by="user_loc",all.x=TRUE)
+
+data$majority_gop = as.numeric(data$per_gop>data$per_dem)
+
+
+```
+
+
+# Combining Thanksgiving and Christmas (Mobility)
+
+```{r}
+
+#Travel
+
+thanks_data2 <- filter(data2,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+christ_data2 <- filter(data2,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+both2 <- bind_rows(thanks_data2,
+                   christ_data2)
+thanks_i2 <- c(rep(FALSE,
+                  nrow(thanks_data2)),
+              rep(TRUE,
+                  nrow(thanks_data2)))
+christ_i2 <- c(rep(TRUE,
+                   nrow(christ_data2)),
+               rep(FALSE,
+                   nrow(christ_data2)))
+
+both2$period_1 <- 0
+both2$day_1 <- 0
+both2$day_2 <- 0
+both2$day_3 <- 0
+both2$day_4 <- 0
+both2$day_5 <- 0
+both2$day_6 <- 0
+both2$day_7 <- 0
+both2$treated <- 0
+    
+both2$period_1[as.logical(thanks_i2*(both2$date >= "2020-11-23")*(both2$date <= "2020-11-25"))] <- 1
+both2$day_1[as.logical(thanks_i2*(both2$date == "2020-11-23"))] <- 1
+both2$day_2[as.logical(thanks_i2*(both2$date == "2020-11-24"))] <- 1
+both2$day_3[as.logical(thanks_i2*(both2$date == "2020-11-25"))] <- 1
+both2$treated[thanks_i2] = thanks_data2$high_county_T1
+    
+both2$period_1[as.logical(christ_i2*(both2$date >= "2020-12-21")*(both2$date <= "2020-12-23"))] <- 1
+both2$day_1[as.logical(christ_i2*(both2$date == "2020-12-21"))] <- 1
+both2$day_2[as.logical(christ_i2*(both2$date == "2020-12-22"))] <- 1
+both2$day_3[as.logical(christ_i2*(both2$date == "2020-12-23"))] <- 1
+both2$treated[christ_i2] = christ_data2$high_county_X
+
+both2 <- filter(filter(both2,
+                      !is.na(treated)),
+               period_1 == 1)
+    
+model2 <- lm.cluster(formula = movement_ch ~ treated + day_1*baseline_th_movement_ch + day_2*baseline_th_movement_ch + day_3*baseline_th_movement_ch, 
+                     data = both2, 
+                     cluster = 'user_loc')
+
+analysis2 <- summary(model2)
+
+
+#Leaving-Home
+
+thanks_data3 <- filter(data2,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+christ_data3 <- filter(data2,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+both3 <- bind_rows(thanks_data3,
+                   christ_data3)
+thanks_i3 <- c(rep(FALSE,
+                  nrow(thanks_data3)),
+              rep(TRUE,
+                  nrow(thanks_data3)))
+christ_i3 <- c(rep(TRUE,
+                  nrow(christ_data3)),
+              rep(FALSE,
+                  nrow(christ_data3)))
+
+both3$period_1 <- 0
+both3$day_1 <- 0
+both3$day_2 <- 0
+both3$day_3 <- 0
+both3$day_4 <- 0
+both3$day_5 <- 0
+both3$day_6 <- 0
+both3$day_7 <- 0
+both3$treated <- 0
+    
+both3$period_1[as.logical(thanks_i3*(both3$date == "2020-11-26"))] <- 1
+both3$day_1[as.logical(thanks_i3*(both3$date == "2020-11-26"))] <- 1
+both3$treated[thanks_i3] = thanks_data3$high_county_T1
+    
+both3$period_1[as.logical(christ_i3*(both3$date >= "2020-12-24")*(both3$date <= "2020-12-25"))] <- 1
+both3$day_1[as.logical(christ_i3*(both3$date == "2020-12-24"))] <- 1
+both3$day_2[as.logical(christ_i3*(both3$date == "2020-12-25"))] <- 1
+both3$treated[christ_i3] =  christ_data3$high_county_X
+
+both3 <- filter(filter(both3,
+                      !is.na(treated)),
+               period_1 == 1)
+    
+model3 <- lm.cluster(formula = leave_home ~ treated + day_1*baseline_th_leave_home + day_2*baseline_th_leave_home, 
+                     data = both3, 
+                     cluster = 'user_loc')
+
+analysis3 <- summary(model3)
+  
+
+```
+
+
+##Replicate main result (Mobility)
+
+```{r}
+
+#Travel
+
+coef2 <- analysis2['treated',
+                   'Estimate']
+se2 <- analysis2['treated', 
+                 'Std. Error']
+
+paste0('Travel coefficient for both campaigns: ',
+       round(coef2,
+             3))
+paste0('Travel se for both campaigns: ',
+       round(se2,
+             3))
+paste0('Travel 95% CI for both campaigns: (',
+       round(coef2 - 1.96*se2, 
+             3),
+       ',',
+       round(coef2 + 1.96*se2, 
+             3),
+       ')')
+
+
+#Leaving-Home
+
+coef3 <- analysis3['treated',
+                   'Estimate']
+se3 <- analysis3['treated', 
+                 'Std. Error']
+
+paste0('Leaving-Home coefficient for both campaigns: ',
+       round(coef3,
+             3))
+paste0('Leaving-Home se for both campaigns: ',
+       round(se3,
+             3))
+paste0('Leaving-Home 95% CI for both campaigns: (',
+       round(coef3 - 1.96*se3, 
+             3),
+       ',',
+       round(coef3 + 1.96*se3, 
+             3),
+       ')')
+
+
+
+```
+
+
+
+# Combining Thanksgiving and Christmas (COVID)
+
+```{r}
+
+set.seed(789917873)
+
+thanks_data <- filter(data,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+christ_data <- filter(data,
+                      !(is.na(high_county_X) * is.na(high_county_T1)))
+both <- bind_rows(thanks_data,
+                  christ_data)
+thanks_i <- c(rep(FALSE,
+                  nrow(thanks_data)),
+              rep(TRUE,
+                  nrow(thanks_data)))
+christ_i <- c(rep(TRUE,
+                  nrow(christ_data)),
+              rep(FALSE,
+                  nrow(christ_data)))
+
+thanks_date <- c('2020-12-14')
+christ_date <- c('2021-01-14')
+
+both$treated <- 0
+both$high_county <- 0
+both$baseline_log_cases <- 0
+
+both$period_1[as.logical(thanks_i*(both$date == thanks_date))] <- 1
+
+both$treated[thanks_i] <- thanks_data$treated_T1
+both$high_county[thanks_i] <- thanks_data$high_county_T1
+both$baseline_log_cases[thanks_i] <- thanks_data$baseline_th_log_cases
+
+both$period_1[as.logical(christ_i*(both$date == christ_date))] <- 1
+
+both$treated[christ_i] <- christ_data$treated_X
+both$high_county[christ_i] <- christ_data$high_county_X
+both$baseline_log_cases[christ_i] <- christ_data$baseline_ch_log_cases
+
+both <- filter(both,
+               period_1 == 1,
+               !is.na(high_county))
+model <- lm.cluster(formula = asinh_two_weeks_cases ~ treated + high_county + baseline_log_cases + factor(user_loc), 
+                    data = both, 
+                    cluster='zip')
+
+analysis <- summary(model)
+
+```
+
+
+##Replicate main result (COVID)
+
+```{r}
+
+set.seed(789917873)
+
+coef <- analysis['treated',
+                 'Estimate']
+se <- analysis['treated', 
+               'Std. Error']
+
+paste0('COVID coefficient for both campaigns: ',
+       round(coef,
+             3))
+paste0('COVID se for both campaigns: ',
+       round(se,
+             3))
+paste0('COVID 95% CI for both campaigns: (',
+       round(coef - 1.96*se, 
+             3),
+       ',',
+       round(coef + 1.96*se, 
+             3),
+       ')')
+
+```
+
+
+##Re-analysis
+
+
+# Required functions
+
+```{r}
+OS_est = function(z, y, x, out.family = gaussian, 
+                  truncpscore = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = summary(glm.cluster(formula = z ~ x, family=gaussian, data = drop_na(both),
+                                    cluster=drop_na(both)$zip))["(Intercept)","Estimate"]
+     pscore   = pmax(truncpscore[1], pmin(truncpscore[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = summary(glm.cluster(formula = y ~ x, data = drop_na(both), weights = z,
+                    family = out.family, cluster=drop_na(both)$zip))["(Intercept)","Estimate"]
+     outcome0 = summary(glm.cluster(formula = y ~ x, data = drop_na(both), weights = (1 - z), 
+                    family = out.family, cluster=drop_na(both)$zip))["(Intercept)","Estimate"]
+     
+     ## regression imputation estimator
+     ace.reg  = mean(outcome1 - outcome0) 
+     ## IPW estimators
+     ace.ipw0 = mean(z*y/pscore - (1 - z)*y/(1 - pscore))
+     ace.ipw  = mean(z*y/pscore)/mean(z/pscore) - 
+                   mean((1 - z)*y/(1 - pscore))/mean((1 - z)/(1 - pscore))
+     ## doubly robust estimator
+     res1     = y - outcome1
+     res0     = y - outcome0
+     ace.dr   = ace.reg + mean(z*res1/pscore - (1 - z)*res0/(1 - pscore))
+
+     return(c(ace.reg, ace.ipw0, ace.ipw, ace.dr))     
+}
+
+
+OS_ATE = function(z, y, x, n.boot = 2*10^2,
+                     out.family = gaussian, truncpscore = c(0, 1))
+{
+     point.est  = OS_est(z, y, x, out.family, truncpscore)
+     
+     ## nonparametric bootstrap
+     n.sample   = length(z)
+     x          = as.matrix(x)
+     boot.est   = replicate(n.boot, 
+                  {id.boot = sample(1:n.sample, n.sample, replace = TRUE)
+                  OS_est(z[id.boot], y[id.boot], x[id.boot, ], 
+                         out.family, truncpscore)})
+
+     boot.se    = apply(boot.est, 1, sd)
+     
+     res        = rbind(point.est, boot.se)
+     rownames(res) = c("est", "se")
+     colnames(res) = c("reg", "HT", "Hajek", "DR")
+     
+     return(res)
+}
+
+OS_est2 = function(z, y, x, interxn, out.family = gaussian, 
+                   truncpscore = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = summary(glm.cluster(formula = z ~ x*interxn, family=gaussian, data = drop_na(both2),
+                                    cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     pscore   = pmax(truncpscore[1], pmin(truncpscore[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = summary(glm.cluster(formula = y ~ x*interxn, data = drop_na(both2), weights = z,
+                    family = out.family, cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     outcome0 = summary(glm.cluster(formula = y ~ x*interxn, data = drop_na(both2), weights = (1 - z), 
+                    family = out.family, cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     
+     ## regression imputation estimator
+     ace.reg  = mean(outcome1 - outcome0) 
+     ## IPW estimators
+     ace.ipw0 = mean(z*y/pscore - (1 - z)*y/(1 - pscore))
+     ace.ipw  = mean(z*y/pscore)/mean(z/pscore) - 
+                   mean((1 - z)*y/(1 - pscore))/mean((1 - z)/(1 - pscore))
+     ## doubly robust estimator
+     res1     = y - outcome1
+     res0     = y - outcome0
+     ace.dr   = ace.reg + mean(z*res1/pscore - (1 - z)*res0/(1 - pscore))
+
+     return(c(ace.reg, ace.ipw0, ace.ipw, ace.dr))     
+}
+
+
+OS_ATE2 = function(z, y, x, interxn, n.boot = 2*10^2,
+                     out.family = gaussian, truncpscore = c(0, 1))
+{
+     point.est  = OS_est2(z, y, x, interxn, out.family, truncpscore)
+     
+     ## nonparametric bootstrap
+     n.sample   = length(z)
+     x          = as.matrix(x)
+     boot.est   = replicate(n.boot, 
+                  {id.boot = sample(1:n.sample, n.sample, replace = TRUE)
+                  OS_est2(z[id.boot], y[id.boot], x[id.boot, ], interxn[id.boot], 
+                         out.family, truncpscore)})
+
+     boot.se    = apply(boot.est, 1, sd)
+     
+     res        = rbind(point.est, boot.se)
+     rownames(res) = c("est", "se")
+     colnames(res) = c("reg", "HT", "Hajek", "DR")
+     
+     return(res)
+}
+
+OS_est2b = function(z, y, x, x_add, interxn, out.family = gaussian, 
+                   truncpscore = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = summary(glm.cluster(formula = z ~ x*interxn + x_add, family=gaussian, data = drop_na(both2),
+                                    cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     pscore   = pmax(truncpscore[1], pmin(truncpscore[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = summary(glm.cluster(formula = y ~ x*interxn + x_add, data = drop_na(both2), weights = z,
+                    family = out.family, cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     outcome0 = summary(glm.cluster(formula = y ~ x*interxn + x_add, data = drop_na(both2), weights = (1 - z), 
+                    family = out.family, cluster=drop_na(both2)$county))["(Intercept)","Estimate"]
+     
+     ## regression imputation estimator
+     ace.reg  = mean(outcome1 - outcome0) 
+     ## IPW estimators
+     ace.ipw0 = mean(z*y/pscore - (1 - z)*y/(1 - pscore))
+     ace.ipw  = mean(z*y/pscore)/mean(z/pscore) - 
+                   mean((1 - z)*y/(1 - pscore))/mean((1 - z)/(1 - pscore))
+     ## doubly robust estimator
+     res1     = y - outcome1
+     res0     = y - outcome0
+     ace.dr   = ace.reg + mean(z*res1/pscore - (1 - z)*res0/(1 - pscore))
+
+     return(c(ace.reg, ace.ipw0, ace.ipw, ace.dr))     
+}
+
+
+OS_ATE2b = function(z, y, x, x_add, interxn, n.boot = 2*10^2,
+                     out.family = gaussian, truncpscore = c(0, 1))
+{
+     point.est  = OS_est2b(z, y, x, x_add, interxn, out.family, truncpscore)
+     
+     ## nonparametric bootstrap
+     n.sample   = length(z)
+     x          = as.matrix(x)
+     boot.est   = replicate(n.boot, 
+                  {id.boot = sample(1:n.sample, n.sample, replace = TRUE)
+                  OS_est2b(z[id.boot], y[id.boot], x[id.boot, ], x_add[id.boot, ], interxn[id.boot], 
+                         out.family, truncpscore)})
+
+     boot.se    = apply(boot.est, 1, sd)
+     
+     res        = rbind(point.est, boot.se)
+     rownames(res) = c("est", "se")
+     colnames(res) = c("reg", "HT", "Hajek", "DR")
+     
+     return(res)
+}
+
+OS_est3 = function(z, y, x, interxn, out.family = gaussian, 
+                   truncpscore = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = summary(glm.cluster(formula = z ~ x*interxn, family=gaussian, data = drop_na(both3),
+                                    cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     pscore   = pmax(truncpscore[1], pmin(truncpscore[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = summary(glm.cluster(formula = y ~ x, data = drop_na(both3), weights = z,
+                    family = out.family, cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     outcome0 = summary(glm.cluster(formula = y ~ x, data = drop_na(both3), weights = (1 - z), 
+                    family = out.family, cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     
+     ## regression imputation estimator
+     ace.reg  = mean(outcome1 - outcome0) 
+     ## IPW estimators
+     ace.ipw0 = mean(z*y/pscore - (1 - z)*y/(1 - pscore))
+     ace.ipw  = mean(z*y/pscore)/mean(z/pscore) - 
+                   mean((1 - z)*y/(1 - pscore))/mean((1 - z)/(1 - pscore))
+     ## doubly robust estimator
+     res1     = y - outcome1
+     res0     = y - outcome0
+     ace.dr   = ace.reg + mean(z*res1/pscore - (1 - z)*res0/(1 - pscore))
+
+     return(c(ace.reg, ace.ipw0, ace.ipw, ace.dr))     
+}
+
+
+OS_ATE3 = function(z, y, x, interxn, n.boot = 2*10^2,
+                     out.family = gaussian, truncpscore = c(0, 1))
+{
+     point.est  = OS_est3(z, y, x, interxn, out.family, truncpscore)
+     
+     ## nonparametric bootstrap
+     n.sample   = length(z)
+     x          = as.matrix(x)
+     boot.est   = replicate(n.boot, 
+                  {id.boot = sample(1:n.sample, n.sample, replace = TRUE)
+                  OS_est3(z[id.boot], y[id.boot], x[id.boot, ], interxn[id.boot], 
+                         out.family, truncpscore)})
+
+     boot.se    = apply(boot.est, 1, sd)
+     
+     res        = rbind(point.est, boot.se)
+     rownames(res) = c("est", "se")
+     colnames(res) = c("reg", "HT", "Hajek", "DR")
+     
+     return(res)
+}
+
+OS_est3b = function(z, y, x, x_add, interxn, out.family = gaussian, 
+                   truncpscore = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = summary(glm.cluster(formula = z ~ x*interxn + x_add, family=gaussian, data = drop_na(both3),
+                                    cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     pscore   = pmax(truncpscore[1], pmin(truncpscore[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = summary(glm.cluster(formula = y ~ x*interxn + x_add, data = drop_na(both3), weights = z,
+                    family = out.family, cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     outcome0 = summary(glm.cluster(formula = y ~ x*interxn + x_add, data = drop_na(both3), weights = (1 - z), 
+                    family = out.family, cluster=drop_na(both3)$county))["(Intercept)","Estimate"]
+     
+     ## regression imputation estimator
+     ace.reg  = mean(outcome1 - outcome0) 
+     ## IPW estimators
+     ace.ipw0 = mean(z*y/pscore - (1 - z)*y/(1 - pscore))
+     ace.ipw  = mean(z*y/pscore)/mean(z/pscore) - 
+                   mean((1 - z)*y/(1 - pscore))/mean((1 - z)/(1 - pscore))
+     ## doubly robust estimator
+     res1     = y - outcome1
+     res0     = y - outcome0
+     ace.dr   = ace.reg + mean(z*res1/pscore - (1 - z)*res0/(1 - pscore))
+
+     return(c(ace.reg, ace.ipw0, ace.ipw, ace.dr))     
+}
+
+
+OS_ATE3b = function(z, y, x, x_add, interxn, n.boot = 2*10^2,
+                     out.family = gaussian, truncpscore = c(0, 1))
+{
+     point.est  = OS_est3b(z, y, x, x_add, interxn, out.family, truncpscore)
+     
+     ## nonparametric bootstrap
+     n.sample   = length(z)
+     x          = as.matrix(x)
+     boot.est   = replicate(n.boot, 
+                  {id.boot = sample(1:n.sample, n.sample, replace = TRUE)
+                  OS_est3b(z[id.boot], y[id.boot], x[id.boot, ], x_add[id.boot, ], interxn[id.boot], 
+                         out.family, truncpscore)})
+
+     boot.se    = apply(boot.est, 1, sd)
+     
+     res        = rbind(point.est, boot.se)
+     rownames(res) = c("est", "se")
+     colnames(res) = c("reg", "HT", "Hajek", "DR")
+     
+     return(res)
+}
+```
+
+
+# Travel: with original covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both2)$movement_ch
+z = drop_na(both2)$treated
+x = select(drop_na(both2), day_1, day_2, day_3)
+interxn = drop_na(both2)$baseline_th_movement_ch
+
+x = as.matrix(x)
+causaleffects = OS_ATE2(z, y, x, interxn, n.boot = 10)
+paste0('Travel Estimators:')
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE2(z, y, x, interxn, n.boot = 10,
+                        
+                        truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+```
+
+
+# Travel: with additional covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both2)$movement_ch
+z = drop_na(both2)$treated
+x = select(drop_na(both2), day_1, day_2, day_3, day_4, day_5, day_6, day_7)
+x_add = select(drop_na(both2), high_education, propurban)
+interxn = drop_na(both2)$baseline_th_movement_ch
+
+x = as.matrix(x)
+x_add = as.matrix(x_add)
+causaleffects = OS_ATE2b(z, y, x, x_add, interxn, n.boot = 10)
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE2b(z, y, x, x_add, interxn, n.boot = 10,
+                        
+                        truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+```
+
+
+# Leaving-home: with original covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both3)$leave_home
+z = drop_na(both3)$treated
+x = select(drop_na(both3), day_1, day_2)
+interxn = drop_na(both3)$baseline_th_leave_home
+
+x = as.matrix(x)
+causaleffects = OS_ATE3(z, y, x, interxn, n.boot = 10)
+paste0('Leaving-home Estimators:')
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE3(z, y, x, interxn, n.boot = 10,
+                          truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+```
+
+
+# Leaving-home: with additional covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both3)$leave_home
+z = drop_na(both3)$treated
+x = select(drop_na(both3), day_1, day_2, day_3, day_4, day_5, day_6, day_7)
+x_add = select(drop_na(both3), high_education, propurban)
+interxn = drop_na(both3)$baseline_th_leave_home
+
+x = as.matrix(x)
+x_add = as.matrix(x_add)
+causaleffects = OS_ATE3b(z, y, x, x_add, interxn, n.boot = 10)
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE3b(z, y, x, x_add, interxn, n.boot = 10,
+                          truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+```
+
+
+# Covid: with original covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both)$asinh_two_weeks_cases
+z = drop_na(both)$treated
+x = select(drop_na(both), high_county, baseline_log_cases, user_loc)
+
+x = scale(x)
+causaleffects = OS_ATE(z, y, x, n.boot = 10)
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE(z, y, x, n.boot = 10,
+                       truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+```
+
+
+# Covid: with additional covariates
+
+```{r}
+
+set.seed(789917873)
+
+y = drop_na(both)$asinh_two_weeks_cases
+z = drop_na(both)$treated
+x = select(drop_na(both), high_county, baseline_log_cases, user_loc, urban, high_education)
+
+x = scale(x)
+causaleffects = OS_ATE(z, y, x, n.boot = 10)
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+
+### checking the data
+#pscore   = glm(z ~ x, family = binomial)$fitted.values
+
+### truncated propensity score
+causaleffects = OS_ATE(z, y, x, n.boot = 10,
+                       truncpscore = c(0.1, 0.9))
+causaleffects = round(causaleffects, 3)
+rbind(causaleffects[1, ] - 1.96*causaleffects[2, ],
+      causaleffects[1, ] + 1.96*causaleffects[2, ])
+```
+
